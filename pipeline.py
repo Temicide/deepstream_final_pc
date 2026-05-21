@@ -25,16 +25,19 @@ import pyds
 from colorpostgresSQL.vehicle_color_rule import detect_color
 from config import (
     CLASSIFIER_BACKEND,
+    CLASSIFIER_CACHE_TTL_SEC,
     CLASSIFIER_ENGINE_PATH,
     CLASSIFIER_INPUT_SIZE,
     CLASSIFIER_LABELS_PATH,
     CLASSIFIER_MIN_CONFIDENCE,
     CLASSIFIER_MODEL_PATH,
     CLASSIFIER_OPERATE_ON_CLASS_IDS,
+    COLOR_CACHE_TTL_SEC as CONFIG_COLOR_CACHE_TTL_SEC,
     DETECTOR_CLUSTER_MODE,
     DETECTOR_CONFIDENCE_THRESHOLD,
     DETECTOR_CUSTOM_LIB_PATH,
     DETECTOR_ENGINE_PATH,
+    DETECTOR_FILTER_OUT_CLASS_IDS,
     DETECTOR_INFER_DIMS,
     DETECTOR_INTERVAL,
     DETECTOR_LABELS_PATH,
@@ -48,6 +51,7 @@ from config import (
     DETECTION_LOG_BATCH_SIZE,
     DETECTION_LOG_FLUSH_INTERVAL_SEC,
     DETECTION_LOG_MAX_RECENT,
+    DETECTION_LOG_TRACK_INTERVAL_SEC,
     DETECTION_LOG_TIMEOUT_SEC,
     JPEG_QUALITY,
     JETSON_ID,
@@ -59,6 +63,12 @@ from config import (
     PRIMARY_GIE_ID,
     PROJECT_ROOT,
     SOURCE_BIN_FACTORY,
+    TRACKER_CONFIG_FILE,
+    TRACKER_ENABLE,
+    TRACKER_ENABLE_BATCH_PROCESS,
+    TRACKER_HEIGHT,
+    TRACKER_LIB_FILE,
+    TRACKER_WIDTH,
     RTSP_URLS,
     TILER_COLUMNS,
     TILER_HEIGHT,
@@ -71,8 +81,10 @@ from config import (
 Gst.init(None)
 
 
-COLOR_CACHE_TTL_SEC = 1.5
-COLOR_CACHE_MAX_ITEMS = 2048
+BRAND_CACHE_TTL_SEC = float(CLASSIFIER_CACHE_TTL_SEC)
+COLOR_CACHE_TTL_SEC = float(CONFIG_COLOR_CACHE_TTL_SEC)
+METADATA_CACHE_MAX_ITEMS = 2048
+LOG_CACHE_MAX_ITEMS = 4096
 COLOR_CROP_MAX_DIM = 160
 MIN_COLOR_CROP_PIXELS = 100
 UNKNOWN_COLOR = "Unknown"
@@ -138,6 +150,7 @@ class SharedFrame:
     def __init__(self):
         self._lock = threading.Lock()
         self._jpeg: Optional[bytes] = None
+        self._frame_bgr: Optional[np.ndarray] = None
         self._updated_at = 0.0
 
     def set_jpeg(self, jpeg: bytes):
@@ -145,9 +158,22 @@ class SharedFrame:
             self._jpeg = jpeg
             self._updated_at = time.time()
 
+    def set_frame(self, frame_bgr: np.ndarray, jpeg: Optional[bytes] = None):
+        with self._lock:
+            self._frame_bgr = frame_bgr
+            if jpeg is not None:
+                self._jpeg = jpeg
+            self._updated_at = time.time()
+
     def get_jpeg(self) -> Optional[bytes]:
         with self._lock:
             return self._jpeg
+
+    def get_frame_bgr(self) -> Optional[np.ndarray]:
+        with self._lock:
+            if self._frame_bgr is None:
+                return None
+            return self._frame_bgr.copy()
 
     def age_sec(self) -> Optional[float]:
         with self._lock:
@@ -385,6 +411,13 @@ def clamp_bbox(left, top, width, height, frame_w, frame_h):
     return x1, y1, x2, y2
 
 
+def normalize_track_id(track_id) -> str:
+    value = "" if track_id is None else str(track_id)
+    if value in UNTRACKED_OBJECT_IDS:
+        return ""
+    return value
+
+
 def draw_label(frame, text, x, y, color):
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = 0.55
@@ -488,19 +521,29 @@ def make_detection_record(class_name, rect, cam_idx, confidence, track_id="", br
     return record
 
 
+def resolve_detector_engine_path(model_path: Path, model_is_engine: bool) -> Path:
+    if DETECTOR_ENGINE_PATH:
+        return Path(abs_path(DETECTOR_ENGINE_PATH))
+    if model_is_engine:
+        return model_path
+
+    precision = {0: "fp32", 1: "int8", 2: "fp16"}.get(DETECTOR_NETWORK_MODE, "fp16")
+    dims_tag = DETECTOR_INFER_DIMS.replace(";", "x").replace(",", "x")
+    config_candidate = model_path.with_name(
+        f"{model_path.name}_b{len(RTSP_URLS)}_{dims_tag}_gpu0_{precision}.engine"
+    )
+    if config_candidate.exists():
+        return config_candidate
+    return config_candidate
+
+
 def build_detector_config() -> str:
     config_path = PROJECT_ROOT / "models" / "generated" / "config_infer_primary.txt"
     ensure_dir(config_path)
 
     model_path = Path(abs_path(DETECTOR_MODEL_PATH))
     model_is_engine = model_path.suffix.lower() == ".engine"
-    if DETECTOR_ENGINE_PATH:
-        engine_path = Path(abs_path(DETECTOR_ENGINE_PATH))
-    elif model_is_engine:
-        engine_path = model_path
-    else:
-        precision = {0: "fp32", 1: "int8", 2: "fp16"}.get(DETECTOR_NETWORK_MODE, "fp16")
-        engine_path = model_path.with_name(f"{model_path.name}_b{len(RTSP_URLS)}_gpu0_{precision}.engine")
+    engine_path = resolve_detector_engine_path(model_path, model_is_engine)
 
     lines = [
         "[property]",
@@ -523,6 +566,8 @@ def build_detector_config() -> str:
     if not model_is_engine:
         lines.insert(4, f"onnx-file={model_path}")
 
+    if DETECTOR_FILTER_OUT_CLASS_IDS:
+        lines.append(f"filter-out-class-ids={DETECTOR_FILTER_OUT_CLASS_IDS}")
     if DETECTOR_CUSTOM_LIB_PATH:
         lines.append(f"custom-lib-path={abs_path(DETECTOR_CUSTOM_LIB_PATH)}")
     if DETECTOR_PARSE_BBOX_FUNC:
@@ -562,7 +607,11 @@ class CombinedDeepStreamPipeline:
         self._mosaic_fps = FpsMeter()
         self._source_bins = {}
         self._mux_sinkpads = {}
+        self._metadata_lock = threading.RLock()
+        self._classifier_lock = threading.Lock()
+        self._brand_cache = {}
         self._color_cache = {}
+        self._last_log_by_object = {}
         self._detection_logger = DetectionBatchLogger(
             DETECTION_LOG_API_URL,
             JETSON_ID,
@@ -714,7 +763,8 @@ class CombinedDeepStreamPipeline:
         if not self.classifier.enabled or crop_bgr.size == 0:
             return None, None
         tensor = preprocess_classifier(crop_bgr, self.classifier.nchw_size(CLASSIFIER_INPUT_SIZE))
-        outputs = self.classifier.run(tensor)
+        with self._classifier_lock:
+            outputs = self.classifier.run(tensor)
         if not outputs:
             return None, None
         logits = outputs[0]
@@ -726,9 +776,9 @@ class CombinedDeepStreamPipeline:
         brand_name = self._classifier_labels.get(str(brand_id), f"class_{brand_id}")
         return brand_name, confidence
 
-    def _color_cache_key(self, source_id, class_id, rect, track_id):
-        track_id = "" if track_id is None else str(track_id)
-        if track_id not in UNTRACKED_OBJECT_IDS:
+    def _object_cache_key(self, source_id, class_id, rect, track_id):
+        track_id = normalize_track_id(track_id)
+        if track_id:
             return ("track", int(source_id), track_id)
 
         return (
@@ -741,28 +791,79 @@ class CombinedDeepStreamPipeline:
             int(float(rect.height) // 16),
         )
 
-    def _prune_color_cache(self, now):
-        if len(self._color_cache) <= COLOR_CACHE_MAX_ITEMS:
+    def _prune_metadata_cache(self, cache, ttl_sec, now):
+        if len(cache) <= METADATA_CACHE_MAX_ITEMS:
             return
-        expired_before = now - (COLOR_CACHE_TTL_SEC * 4.0)
-        self._color_cache = {
-            key: value
-            for key, value in self._color_cache.items()
-            if value[1] >= expired_before
-        }
-        if len(self._color_cache) > COLOR_CACHE_MAX_ITEMS:
-            newest = sorted(self._color_cache.items(), key=lambda item: item[1][1], reverse=True)
-            self._color_cache = dict(newest[:COLOR_CACHE_MAX_ITEMS])
+        expired_before = now - (float(ttl_sec) * 4.0)
+        stale_keys = [
+            key
+            for key, value in cache.items()
+            if float(value.get("updated_at", 0.0)) < expired_before
+        ]
+        for key in stale_keys:
+            cache.pop(key, None)
+        if len(cache) > METADATA_CACHE_MAX_ITEMS:
+            newest = sorted(cache.items(), key=lambda item: item[1].get("updated_at", 0.0), reverse=True)
+            cache.clear()
+            cache.update(dict(newest[:METADATA_CACHE_MAX_ITEMS]))
+
+    def _classify_cached_crop(self, crop_bgr, source_id, class_id, rect, track_id):
+        if crop_bgr is None or crop_bgr.size == 0:
+            return None, None
+
+        now = time.time()
+        cache_key = self._object_cache_key(source_id, class_id, rect, track_id)
+        with self._metadata_lock:
+            cached = self._brand_cache.get(cache_key)
+            if cached and now - cached.get("updated_at", 0.0) < BRAND_CACHE_TTL_SEC:
+                return cached.get("brand"), cached.get("confidence")
+
+        brand, confidence = self._classify_crop(crop_bgr)
+        with self._metadata_lock:
+            self._brand_cache[cache_key] = {
+                "brand": brand,
+                "confidence": confidence,
+                "updated_at": now,
+            }
+            self._prune_metadata_cache(self._brand_cache, BRAND_CACHE_TTL_SEC, now)
+        return brand, confidence
+
+    def _prune_log_cache(self, now):
+        if len(self._last_log_by_object) <= LOG_CACHE_MAX_ITEMS:
+            return
+        interval = max(0.1, float(DETECTION_LOG_TRACK_INTERVAL_SEC))
+        expired_before = now - (interval * 8.0)
+        stale_keys = [key for key, updated_at in self._last_log_by_object.items() if updated_at < expired_before]
+        for key in stale_keys:
+            self._last_log_by_object.pop(key, None)
+        if len(self._last_log_by_object) > LOG_CACHE_MAX_ITEMS:
+            newest = sorted(self._last_log_by_object.items(), key=lambda item: item[1], reverse=True)
+            self._last_log_by_object = dict(newest[:LOG_CACHE_MAX_ITEMS])
+
+    def _should_log_detection(self, source_id, class_id, rect, track_id, now):
+        interval = float(DETECTION_LOG_TRACK_INTERVAL_SEC)
+        if interval <= 0:
+            return True
+
+        cache_key = self._object_cache_key(source_id, class_id, rect, track_id)
+        with self._metadata_lock:
+            last_logged_at = self._last_log_by_object.get(cache_key)
+            if last_logged_at is not None and now - last_logged_at < interval:
+                return False
+            self._last_log_by_object[cache_key] = now
+            self._prune_log_cache(now)
+        return True
 
     def _detect_crop_color(self, crop_bgr, source_id, class_id, rect, track_id):
         if crop_bgr is None or crop_bgr.size < MIN_COLOR_CROP_PIXELS:
             return UNKNOWN_COLOR
 
         now = time.time()
-        cache_key = self._color_cache_key(source_id, class_id, rect, track_id)
-        cached = self._color_cache.get(cache_key)
-        if cached and now - cached[1] < COLOR_CACHE_TTL_SEC:
-            return cached[0]
+        cache_key = self._object_cache_key(source_id, class_id, rect, track_id)
+        with self._metadata_lock:
+            cached = self._color_cache.get(cache_key)
+            if cached and now - cached.get("updated_at", 0.0) < COLOR_CACHE_TTL_SEC:
+                return cached.get("color", UNKNOWN_COLOR)
 
         h, w = crop_bgr.shape[:2]
         if h <= 0 or w <= 0:
@@ -777,8 +878,12 @@ class CombinedDeepStreamPipeline:
                 color_crop = cv2.resize(crop_bgr, (resized_w, resized_h), interpolation=cv2.INTER_AREA)
             color_name = detect_color(color_crop)
 
-        self._color_cache[cache_key] = (color_name, now)
-        self._prune_color_cache(now)
+        with self._metadata_lock:
+            self._color_cache[cache_key] = {
+                "color": color_name,
+                "updated_at": now,
+            }
+            self._prune_metadata_cache(self._color_cache, COLOR_CACHE_TTL_SEC, now)
         return color_name
 
     def _queue_detection_log(self, class_name, rect, cam_idx, confidence, track_id="", brand="", color=""):
@@ -815,6 +920,10 @@ class CombinedDeepStreamPipeline:
                 break
 
             class_id = int(obj_meta.class_id)
+            if class_id not in VEHICLE_CLASS_IDS:
+                l_obj = l_obj.next
+                continue
+
             class_name = getattr(obj_meta, "label", "") or resolve_label(self._detector_label_map, class_id)
             rect = obj_meta.rect_params
             x1, y1, x2, y2 = clamp_bbox(
@@ -830,24 +939,27 @@ class CombinedDeepStreamPipeline:
                 continue
 
             source_id = int(frame_meta.source_id)
-            track_id = getattr(obj_meta, "object_id", "")
+            track_id = normalize_track_id(getattr(obj_meta, "object_id", ""))
+            crop = frame_bgr[y1:y2, x1:x2]
             if class_id in self._classify_class_ids:
-                crop = frame_bgr[y1:y2, x1:x2]
-                brand, confidence = self._classify_crop(crop)
-                vehicle_color = self._detect_crop_color(crop, source_id, class_id, rect, track_id)
+                brand, confidence = self._classify_cached_crop(crop, source_id, class_id, rect, track_id)
             else:
                 brand, confidence = None, None
-                vehicle_color = ""
+            vehicle_color = self._detect_crop_color(crop, source_id, class_id, rect, track_id)
 
-            self._queue_detection_log(
-                class_name,
-                rect,
-                source_id,
-                confidence,
-                track_id=track_id,
-                brand=brand or "",
-                color="" if vehicle_color == UNKNOWN_COLOR else vehicle_color,
-            )
+            now = time.time()
+            detector_confidence = getattr(obj_meta, "confidence", None)
+            log_confidence = confidence if confidence is not None else detector_confidence
+            if self._should_log_detection(source_id, class_id, rect, track_id, now):
+                self._queue_detection_log(
+                    class_name,
+                    rect,
+                    source_id,
+                    log_confidence,
+                    track_id=track_id,
+                    brand=brand or "",
+                    color="" if vehicle_color == UNKNOWN_COLOR else vehicle_color,
+                )
 
             box_color = (40, 180, 40)
             if class_id == 7:
@@ -911,8 +1023,7 @@ class CombinedDeepStreamPipeline:
             fps = self._fps_meters[f"cam{cam_idx}"].tick()
             frame_bgr = self._overlay_fps(frame_bgr, fps, f"Cam{cam_idx + 1}")
             jpg = encode_jpeg(frame_bgr)
-            if jpg:
-                self.camera_frames[cam_idx].set_jpeg(jpg)
+            self.camera_frames[cam_idx].set_frame(frame_bgr, jpg)
 
         except Exception as exc:
             print(f"[ERROR] cam{cam_idx} appsink failed: {exc!r}")
@@ -924,16 +1035,12 @@ class CombinedDeepStreamPipeline:
     def _build_mosaic(self) -> Optional[bytes]:
         frames = []
         for idx, shared in enumerate(self.camera_frames):
-            jpeg = shared.get_jpeg()
-            if not jpeg:
+            frame = shared.get_frame_bgr()
+            if frame is None:
                 empty = np.zeros((MUX_HEIGHT, MUX_WIDTH, 3), dtype=np.uint8)
                 draw_label(empty, f"Cam{idx + 1} waiting", 12, 40, (80, 80, 80))
                 frames.append(empty)
                 continue
-            arr = np.frombuffer(jpeg, dtype=np.uint8)
-            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if frame is None:
-                frame = np.zeros((MUX_HEIGHT, MUX_WIDTH, 3), dtype=np.uint8)
             frames.append(frame)
 
         if not frames:
@@ -971,6 +1078,26 @@ class CombinedDeepStreamPipeline:
                     self.shared_frame.set_jpeg(fallback)
             time.sleep(delay)
 
+    def _set_optional_property(self, element, property_name: str, value):
+        try:
+            element.set_property(property_name, value)
+            return True
+        except Exception as exc:
+            print(f"[WARN] Could not set {element.get_name()}.{property_name}={value!r}: {exc}")
+            return False
+
+    def _make_tracker(self):
+        tracker = make_element("nvtracker", "tracker")
+        self._set_optional_property(tracker, "tracker-width", int(TRACKER_WIDTH))
+        self._set_optional_property(tracker, "tracker-height", int(TRACKER_HEIGHT))
+        self._set_optional_property(tracker, "gpu-id", 0)
+        self._set_optional_property(tracker, "enable-batch-process", int(bool(TRACKER_ENABLE_BATCH_PROCESS)))
+        if TRACKER_LIB_FILE:
+            self._set_optional_property(tracker, "ll-lib-file", abs_path(TRACKER_LIB_FILE))
+        if TRACKER_CONFIG_FILE:
+            self._set_optional_property(tracker, "ll-config-file", abs_path(TRACKER_CONFIG_FILE))
+        return tracker
+
     def build(self):
         if len(RTSP_URLS) > MAX_RTSP_SOURCES:
             raise ValueError(f"DetectPipeline supports up to {MAX_RTSP_SOURCES} RTSP sources")
@@ -1006,6 +1133,10 @@ class CombinedDeepStreamPipeline:
         pgie.set_property("config-file-path", infer_config_path)
         self.pipeline.add(pgie)
 
+        tracker = self._make_tracker() if TRACKER_ENABLE else None
+        if tracker:
+            self.pipeline.add(tracker)
+
         pre_osd_conv = make_element("nvvideoconvert", "pre-osd-converter")
         pre_osd_caps = make_element("capsfilter", "pre-osd-caps")
         pre_osd_caps.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM), format=RGBA"))
@@ -1024,7 +1155,12 @@ class CombinedDeepStreamPipeline:
 
         if not streammux.link(pgie):
             raise RuntimeError("Failed to link streammux -> pgie")
-        if not pgie.link(pre_osd_conv):
+        if tracker:
+            if not pgie.link(tracker):
+                raise RuntimeError("Failed to link pgie -> tracker")
+            if not tracker.link(pre_osd_conv):
+                raise RuntimeError("Failed to link tracker -> pre-osd-converter")
+        elif not pgie.link(pre_osd_conv):
             raise RuntimeError("Failed to link pgie -> pre-osd-converter")
         if not pre_osd_conv.link(pre_osd_caps):
             raise RuntimeError("Failed to link pre-osd-converter -> pre-osd-caps")
@@ -1060,6 +1196,7 @@ class CombinedDeepStreamPipeline:
         print(f"[INFO] Detector config: {infer_config_path}")
         print(f"[INFO] Detector model: {abs_path(DETECTOR_MODEL_PATH)}")
         print(f"[INFO] Classifier model: {abs_path(CLASSIFIER_MODEL_PATH)}")
+        print(f"[INFO] Tracker: {'enabled' if tracker else 'disabled'}")
         return self.pipeline
 
     def start(self):

@@ -1,0 +1,47 @@
+[property]
+enable=1
+config-width=960
+config-height=540
+osd-mode=2
+display-font-size=12
+
+# ---------------------------------------------------------
+# Camera 1 (Stream 0)
+# ---------------------------------------------------------
+[roi-filtering-stream-0]
+enable=1
+# ROI Polygon points: x1;y1;x2;y2;x3;y3... (scaled to 960x540)
+roi-cam1=100;150;400;150;400;300;100;300
+class-id=-1
+
+[line-crossing-stream-0]
+enable=1
+# Line coordinates: x1;y1;x2;y2;x3;y3;x4;y4 (Entry and Exit lines)
+line-crossing-cam1=100;200;400;200;100;220;400;220
+class-id=-1
+
+# ---------------------------------------------------------
+# Camera 2 (Stream 1)
+# ---------------------------------------------------------
+[roi-filtering-stream-1]
+enable=1
+roi-cam2=150;200;450;200;450;350;150;350
+class-id=-1
+
+[line-crossing-stream-1]
+enable=1
+line-crossing-cam2=150;250;450;250;150;270;450;270
+class-id=-1
+
+# ---------------------------------------------------------
+# Camera 3 (Stream 2)
+# ---------------------------------------------------------
+[roi-filtering-stream-2]
+enable=1
+roi-cam3=50;100;350;100;350;250;50;250
+class-id=-1
+
+[line-crossing-stream-2]
+enable=1
+line-crossing-cam3=50;150;350;150;50;170;350;170
+class-id=-1

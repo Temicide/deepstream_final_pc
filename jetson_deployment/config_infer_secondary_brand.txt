@@ -1,0 +1,23 @@
+[property]
+gpu-id=0
+net-scale-factor=1.0
+onnx-file=car_brand_resnet18_model.onnx
+model-engine-file=car_brand_resnet18_model_b16_gpu0_fp16.engine
+# Secondary GIE must have a unique ID different from the primary GIE (1)
+gie-unique-id=2
+# 0: Detector, 1: Classifier, 2: Segmentation, 100: Other
+network-type=1
+# 0: RGB, 1: BGR, 2: GRAY
+model-color-format=0
+# 1: Primary, 2: Secondary
+process-mode=2
+# Set FP16
+network-mode=2
+# Only operate on Cars (Class ID 2 from Primary GIE)
+operate-on-class-ids=2
+num-detected-classes=9
+classifier-threshold=0.51
+is-classifier=1
+labelfile-path=labels_brand.txt
+batch-size=16
+maintain-aspect-ratio=1

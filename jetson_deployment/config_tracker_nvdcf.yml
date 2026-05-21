@@ -1,0 +1,21 @@
+BaseConfig:
+  minDetectorConfidence: 0.35
+
+TargetManagement:
+  enableBboxUnclipped: 1
+  preserveStreamUpdateOrder: 0
+  maxTargetsPerStream: 50
+  minIouDiff4Match: 0.5
+  minTrackerConfidence: 0.2
+  probationAge: 3
+  maxShadowTrackingAge: 15
+  earlyTerminationAge: 1
+
+TrajectoryManagement:
+  useUniqueID: 1
+  validTrajectoryLength: 3
+
+DataAssociation:
+  enableReid: 0
+  thresholdMatrix: 0.3
+  associationMetric: "iou"

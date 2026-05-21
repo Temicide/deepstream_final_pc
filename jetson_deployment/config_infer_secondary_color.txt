@@ -1,0 +1,20 @@
+[property]
+gpu-id=0
+net-scale-factor=1.0
+model-file=/opt/nvidia/deepstream/deepstream/samples/models/Secondary_VehicleColor/resnet18.caffemodel
+proto-file=/opt/nvidia/deepstream/deepstream/samples/models/Secondary_VehicleColor/resnet18.prototxt
+model-engine-file=/opt/nvidia/deepstream/deepstream/samples/models/Secondary_VehicleColor/resnet18.caffemodel_b5_gpu0_fp16.engine
+mean-file=/opt/nvidia/deepstream/deepstream/samples/models/Secondary_VehicleColor/mean.ppm
+labelfile-path=/opt/nvidia/deepstream/deepstream/samples/models/Secondary_VehicleColor/labels.txt
+int8-calib-file=/opt/nvidia/deepstream/deepstream/samples/models/Secondary_VehicleColor/cal_trt.bin
+# 0=Detector, 1=Classifier, 2=Segmentation
+network-type=1
+# 0=RGB, 1=BGR, 2=GRAY
+model-color-format=1
+# Set FP16
+network-mode=2
+# 2 is Car
+operate-on-class-ids=2
+batch-size=5
+maintain-aspect-ratio=1
+output-blob-names=predictions/Softmax
