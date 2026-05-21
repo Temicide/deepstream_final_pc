@@ -146,6 +146,12 @@ def encode_jpeg(frame_bgr: np.ndarray) -> Optional[bytes]:
     return encoded.tobytes()
 
 
+def placeholder_jpeg(message: str, width: int = MUX_WIDTH, height: int = MUX_HEIGHT) -> Optional[bytes]:
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    draw_label(frame, message, 12, 40, (80, 80, 80))
+    return encode_jpeg(frame)
+
+
 class SharedFrame:
     def __init__(self):
         self._lock = threading.Lock()
@@ -731,6 +737,9 @@ class CombinedDeepStreamPipeline:
         self._stop_event = threading.Event()
         self.shared_frame = SharedFrame()
         self.camera_frames = [SharedFrame() for _ in RTSP_URLS]
+        self._camera_waiting_jpegs = [
+            placeholder_jpeg(f"Cam{index + 1} waiting") for index in range(len(RTSP_URLS))
+        ]
         self._fps_meters = {f"cam{i}": FpsMeter() for i in range(len(RTSP_URLS))}
         self._mosaic_fps = FpsMeter()
         self._source_bins = {}
@@ -1380,8 +1389,24 @@ class CombinedDeepStreamPipeline:
 
     def get_camera_jpeg(self, cam_idx: int) -> Optional[bytes]:
         if 0 <= cam_idx < len(self.camera_frames):
-            return self.camera_frames[cam_idx].get_jpeg()
+            frame = self.camera_frames[cam_idx].get_jpeg()
+            if frame is not None:
+                return frame
+            return self._camera_waiting_jpegs[cam_idx]
         return None
+
+    def get_camera_status(self):
+        status = []
+        for index, shared in enumerate(self.camera_frames):
+            age = shared.age_sec()
+            status.append(
+                {
+                    "camera_id": f"cam{index + 1}",
+                    "has_frame": age is not None,
+                    "frame_age_sec": None if age is None else round(age, 2),
+                }
+            )
+        return status
 
     def get_detection_logs(self):
         return self._detection_logger.snapshot()
@@ -1397,7 +1422,7 @@ def _multipart_generator(frame_getter, delay_sec: float):
 
 def create_app():
     from fastapi import FastAPI, Path
-    from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
     app = FastAPI(title="DeepStream Semifinal")
     state = {
@@ -1414,7 +1439,12 @@ def create_app():
             "uptime_sec": round(time.time() - state["started_at"], 2),
             "source_count": len(RTSP_URLS),
             "has_frame": pipeline.get_jpeg() is not None if pipeline else False,
+            "cameras": pipeline.get_camera_status() if pipeline else [],
         }
+
+    @app.get("/")
+    def root():
+        return RedirectResponse("/monitor")
 
     @app.get("/monitor", response_class=HTMLResponse)
     def monitor():
@@ -1479,6 +1509,12 @@ def create_app():
             _multipart_generator(lambda: pipeline.get_camera_jpeg(cam_id - 1), 1.0 / max(1, OUTPUT_FPS)),
             media_type="multipart/x-mixed-replace; boundary=frame",
         )
+
+    @app.get("/cam{cam_id}")
+    @app.get("/cam{cam_id}/")
+    @app.get("/cam{cam_id}/live")
+    def video_cam_alias(cam_id: int = Path(ge=1, le=len(RTSP_URLS))):
+        return video_cam(cam_id)
 
     @app.get("/api/logs/detect")
     def detect_logs_json():
