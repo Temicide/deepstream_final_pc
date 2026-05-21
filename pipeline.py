@@ -658,6 +658,9 @@ def resolve_detector_engine_path(model_path: Path, model_is_engine: bool, infer_
     )
     if config_candidate.exists():
         return config_candidate
+    legacy_candidate = model_path.with_name(f"{model_path.name}_b{len(RTSP_URLS)}_gpu0_{precision}.engine")
+    if legacy_candidate.exists():
+        return legacy_candidate
     return config_candidate
 
 
