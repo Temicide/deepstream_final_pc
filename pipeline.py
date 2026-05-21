@@ -22,6 +22,7 @@ from gi.repository import GLib, Gst
 
 import pyds
 
+from colorpostgresSQL.vehicle_color_rule import detect_color
 from config import (
     CLASSIFIER_BACKEND,
     CLASSIFIER_ENGINE_PATH,
@@ -68,6 +69,14 @@ from config import (
 
 
 Gst.init(None)
+
+
+COLOR_CACHE_TTL_SEC = 1.5
+COLOR_CACHE_MAX_ITEMS = 2048
+COLOR_CROP_MAX_DIM = 160
+MIN_COLOR_CROP_PIXELS = 100
+UNKNOWN_COLOR = "Unknown"
+UNTRACKED_OBJECT_IDS = {"", "-1", "18446744073709551615"}
 
 
 def abs_path(path):
@@ -455,7 +464,7 @@ class DetectionBatchLogger:
         return len(batch)
 
 
-def make_detection_record(class_name, rect, cam_idx, confidence, track_id=""):
+def make_detection_record(class_name, rect, cam_idx, confidence, track_id="", brand="", color=""):
     type_name = str(class_name or "object").strip().lower() or "object"
     left = float(rect.left)
     top = float(rect.top)
@@ -464,8 +473,8 @@ def make_detection_record(class_name, rect, cam_idx, confidence, track_id=""):
     record = {
         "timestamp": utc_timestamp(),
         "type": type_name,
-        "color": "",
-        "brand": "",
+        "color": "" if color is None else str(color),
+        "brand": "" if brand is None else str(brand),
         "x": left,
         "y": top,
         "width": width,
@@ -553,6 +562,7 @@ class CombinedDeepStreamPipeline:
         self._mosaic_fps = FpsMeter()
         self._source_bins = {}
         self._mux_sinkpads = {}
+        self._color_cache = {}
         self._detection_logger = DetectionBatchLogger(
             DETECTION_LOG_API_URL,
             JETSON_ID,
@@ -716,8 +726,71 @@ class CombinedDeepStreamPipeline:
         brand_name = self._classifier_labels.get(str(brand_id), f"class_{brand_id}")
         return brand_name, confidence
 
-    def _queue_detection_log(self, class_name, rect, cam_idx, confidence, track_id=""):
-        record = make_detection_record(class_name, rect, cam_idx, confidence, track_id=track_id)
+    def _color_cache_key(self, source_id, class_id, rect, track_id):
+        track_id = "" if track_id is None else str(track_id)
+        if track_id not in UNTRACKED_OBJECT_IDS:
+            return ("track", int(source_id), track_id)
+
+        return (
+            "bbox",
+            int(source_id),
+            int(class_id),
+            int(float(rect.left) // 16),
+            int(float(rect.top) // 16),
+            int(float(rect.width) // 16),
+            int(float(rect.height) // 16),
+        )
+
+    def _prune_color_cache(self, now):
+        if len(self._color_cache) <= COLOR_CACHE_MAX_ITEMS:
+            return
+        expired_before = now - (COLOR_CACHE_TTL_SEC * 4.0)
+        self._color_cache = {
+            key: value
+            for key, value in self._color_cache.items()
+            if value[1] >= expired_before
+        }
+        if len(self._color_cache) > COLOR_CACHE_MAX_ITEMS:
+            newest = sorted(self._color_cache.items(), key=lambda item: item[1][1], reverse=True)
+            self._color_cache = dict(newest[:COLOR_CACHE_MAX_ITEMS])
+
+    def _detect_crop_color(self, crop_bgr, source_id, class_id, rect, track_id):
+        if crop_bgr is None or crop_bgr.size < MIN_COLOR_CROP_PIXELS:
+            return UNKNOWN_COLOR
+
+        now = time.time()
+        cache_key = self._color_cache_key(source_id, class_id, rect, track_id)
+        cached = self._color_cache.get(cache_key)
+        if cached and now - cached[1] < COLOR_CACHE_TTL_SEC:
+            return cached[0]
+
+        h, w = crop_bgr.shape[:2]
+        if h <= 0 or w <= 0:
+            color_name = UNKNOWN_COLOR
+        else:
+            max_dim = max(h, w)
+            color_crop = crop_bgr
+            if max_dim > COLOR_CROP_MAX_DIM:
+                scale = float(COLOR_CROP_MAX_DIM) / float(max_dim)
+                resized_w = max(1, int(w * scale))
+                resized_h = max(1, int(h * scale))
+                color_crop = cv2.resize(crop_bgr, (resized_w, resized_h), interpolation=cv2.INTER_AREA)
+            color_name = detect_color(color_crop)
+
+        self._color_cache[cache_key] = (color_name, now)
+        self._prune_color_cache(now)
+        return color_name
+
+    def _queue_detection_log(self, class_name, rect, cam_idx, confidence, track_id="", brand="", color=""):
+        record = make_detection_record(
+            class_name,
+            rect,
+            cam_idx,
+            confidence,
+            track_id=track_id,
+            brand=brand,
+            color=color,
+        )
         self._detection_logger.add(record)
 
     def _log_worker(self):
@@ -756,30 +829,44 @@ class CombinedDeepStreamPipeline:
                 l_obj = l_obj.next
                 continue
 
+            source_id = int(frame_meta.source_id)
+            track_id = getattr(obj_meta, "object_id", "")
             if class_id in self._classify_class_ids:
                 crop = frame_bgr[y1:y2, x1:x2]
                 brand, confidence = self._classify_crop(crop)
+                vehicle_color = self._detect_crop_color(crop, source_id, class_id, rect, track_id)
             else:
                 brand, confidence = None, None
+                vehicle_color = ""
 
-            self._queue_detection_log(class_name, rect, int(frame_meta.source_id), confidence, getattr(obj_meta, "object_id", ""))
+            self._queue_detection_log(
+                class_name,
+                rect,
+                source_id,
+                confidence,
+                track_id=track_id,
+                brand=brand or "",
+                color="" if vehicle_color == UNKNOWN_COLOR else vehicle_color,
+            )
 
-            color = (40, 180, 40)
+            box_color = (40, 180, 40)
             if class_id == 7:
-                color = (30, 120, 220)
+                box_color = (30, 120, 220)
             elif class_id == 5:
-                color = (220, 140, 30)
+                box_color = (220, 140, 30)
             elif class_id == 3:
-                color = (180, 60, 200)
+                box_color = (180, 60, 200)
 
             label = f"{class_name}"
+            if vehicle_color and vehicle_color != UNKNOWN_COLOR:
+                label += f" | {vehicle_color}"
             if brand:
                 label += f" | {brand} {confidence:.2f}"
             elif confidence is not None:
                 label += f" | {confidence:.2f}"
 
-            cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color, 2)
-            draw_label(frame_bgr, label, x1, y1, color)
+            cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), box_color, 2)
+            draw_label(frame_bgr, label, x1, y1, box_color)
 
             l_obj = l_obj.next
 
@@ -1128,40 +1215,40 @@ def create_app():
             media_type="multipart/x-mixed-replace; boundary=frame",
         )
 
-        @app.get("/api/logs/detect")
-        def detect_logs_json():
-                pipeline = state["pipeline"]
-                if not pipeline:
-                        return JSONResponse({"error": "pipeline not started"}, status_code=400)
-                return JSONResponse(pipeline.get_detection_logs())
+    @app.get("/api/logs/detect")
+    def detect_logs_json():
+        pipeline = state["pipeline"]
+        if not pipeline:
+            return JSONResponse({"error": "pipeline not started"}, status_code=400)
+        return JSONResponse(pipeline.get_detection_logs())
 
-        @app.get("/logs/detect", response_class=HTMLResponse)
-        def detect_logs_page():
-                pipeline = state["pipeline"]
-                if not pipeline:
-                        return HTMLResponse("<html><body><h3>pipeline not started</h3></body></html>", status_code=400)
-                snapshot = pipeline.get_detection_logs()
-                rows = []
-                for item in reversed(snapshot.get("recent", [])):
-                        rows.append(
-                                "<tr>"
-                                "<td>{timestamp}</td><td>{camera_id}</td><td>{type}</td><td>{x:.1f}</td><td>{y:.1f}</td>"
-                                "<td>{width:.1f}</td><td>{height:.1f}</td><td>{brand}</td><td>{color}</td><td>{track_id}</td>"
-                                "</tr>".format(
-                                        timestamp=item.get("timestamp", ""),
-                                        camera_id=item.get("camera_id", ""),
-                                        type=item.get("type", ""),
-                                        x=float(item.get("x", 0.0)),
-                                        y=float(item.get("y", 0.0)),
-                                        width=float(item.get("width", 0.0)),
-                                        height=float(item.get("height", 0.0)),
-                                        brand=item.get("brand", ""),
-                                        color=item.get("color", ""),
-                                        track_id=item.get("track_id", ""),
-                                )
-                        )
-                table_rows = "".join(rows) or "<tr><td colspan='10'>No detections yet</td></tr>"
-                return f"""
+    @app.get("/logs/detect", response_class=HTMLResponse)
+    def detect_logs_page():
+        pipeline = state["pipeline"]
+        if not pipeline:
+            return HTMLResponse("<html><body><h3>pipeline not started</h3></body></html>", status_code=400)
+        snapshot = pipeline.get_detection_logs()
+        rows = []
+        for item in reversed(snapshot.get("recent", [])):
+            rows.append(
+                "<tr>"
+                "<td>{timestamp}</td><td>{camera_id}</td><td>{type}</td><td>{x:.1f}</td><td>{y:.1f}</td>"
+                "<td>{width:.1f}</td><td>{height:.1f}</td><td>{brand}</td><td>{color}</td><td>{track_id}</td>"
+                "</tr>".format(
+                    timestamp=item.get("timestamp", ""),
+                    camera_id=item.get("camera_id", ""),
+                    type=item.get("type", ""),
+                    x=float(item.get("x", 0.0)),
+                    y=float(item.get("y", 0.0)),
+                    width=float(item.get("width", 0.0)),
+                    height=float(item.get("height", 0.0)),
+                    brand=item.get("brand", ""),
+                    color=item.get("color", ""),
+                    track_id=item.get("track_id", ""),
+                )
+            )
+        table_rows = "".join(rows) or "<tr><td colspan='10'>No detections yet</td></tr>"
+        return f"""
 <!doctype html>
 <html>
 <head>
@@ -1242,4 +1329,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
