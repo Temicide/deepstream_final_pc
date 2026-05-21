@@ -521,14 +521,138 @@ def make_detection_record(class_name, rect, cam_idx, confidence, track_id="", br
     return record
 
 
-def resolve_detector_engine_path(model_path: Path, model_is_engine: bool) -> Path:
+def _read_varint(data: bytes, index: int):
+    shift = 0
+    value = 0
+    while index < len(data):
+        byte = data[index]
+        index += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, index
+        shift += 7
+    raise ValueError("truncated protobuf varint")
+
+
+def _protobuf_fields(data: bytes):
+    index = 0
+    size = len(data)
+    while index < size:
+        key, index = _read_varint(data, index)
+        field_no = key >> 3
+        wire_type = key & 0x07
+        if wire_type == 0:
+            value, index = _read_varint(data, index)
+            yield field_no, wire_type, value
+        elif wire_type == 1:
+            value = data[index : index + 8]
+            index += 8
+            yield field_no, wire_type, value
+        elif wire_type == 2:
+            length, index = _read_varint(data, index)
+            value = data[index : index + length]
+            index += length
+            yield field_no, wire_type, value
+        elif wire_type == 5:
+            value = data[index : index + 4]
+            index += 4
+            yield field_no, wire_type, value
+        else:
+            raise ValueError(f"unsupported protobuf wire type: {wire_type}")
+
+
+def _parse_onnx_dim(dim_proto: bytes):
+    dim_value = None
+    dim_param = None
+    for field_no, wire_type, value in _protobuf_fields(dim_proto):
+        if field_no == 1 and wire_type == 0:
+            dim_value = int(value)
+        elif field_no == 2 and wire_type == 2:
+            dim_param = value.decode("utf-8", errors="ignore")
+    if dim_value is not None:
+        return dim_value
+    return dim_param or None
+
+
+def _parse_onnx_shape(shape_proto: bytes):
+    dims = []
+    for field_no, wire_type, value in _protobuf_fields(shape_proto):
+        if field_no == 1 and wire_type == 2:
+            dims.append(_parse_onnx_dim(value))
+    return dims
+
+
+def _parse_onnx_tensor_type(tensor_type_proto: bytes):
+    for field_no, wire_type, value in _protobuf_fields(tensor_type_proto):
+        if field_no == 2 and wire_type == 2:
+            return _parse_onnx_shape(value)
+    return []
+
+
+def _parse_onnx_value_info(value_info_proto: bytes):
+    name = ""
+    dims = []
+    for field_no, wire_type, value in _protobuf_fields(value_info_proto):
+        if field_no == 1 and wire_type == 2:
+            name = value.decode("utf-8", errors="ignore")
+        elif field_no == 2 and wire_type == 2:
+            for type_field_no, type_wire_type, type_value in _protobuf_fields(value):
+                if type_field_no == 1 and type_wire_type == 2:
+                    dims = _parse_onnx_tensor_type(type_value)
+    return name, dims
+
+
+def detect_onnx_infer_dims(model_path: Path) -> Optional[str]:
+    try:
+        data = model_path.read_bytes()
+        graph_proto = None
+        for field_no, wire_type, value in _protobuf_fields(data):
+            if field_no == 7 and wire_type == 2:
+                graph_proto = value
+                break
+        if not graph_proto:
+            return None
+
+        for field_no, wire_type, value in _protobuf_fields(graph_proto):
+            if field_no != 11 or wire_type != 2:
+                continue
+            _name, dims = _parse_onnx_value_info(value)
+            if len(dims) == 4 and all(isinstance(item, int) and item > 0 for item in dims[1:]):
+                return f"{dims[1]};{dims[2]};{dims[3]}"
+    except Exception as exc:
+        print(f"[WARN] Could not inspect ONNX input dims for {model_path}: {exc}")
+    return None
+
+
+def resolve_detector_infer_dims(model_path: Path, model_is_engine: bool) -> str:
+    requested = str(DETECTOR_INFER_DIMS or "").strip()
+    detected = None
+    if not model_is_engine and model_path.suffix.lower() == ".onnx":
+        detected = detect_onnx_infer_dims(model_path)
+
+    if requested and requested.lower() != "auto":
+        if detected and requested != detected:
+            print(
+                f"[WARN] Requested detector infer-dims={requested} does not match "
+                f"static ONNX input {detected}; using {detected}"
+            )
+            return detected
+        return requested
+
+    if detected:
+        return detected
+
+    return "3;640;640"
+
+
+def resolve_detector_engine_path(model_path: Path, model_is_engine: bool, infer_dims: str) -> Path:
     if DETECTOR_ENGINE_PATH:
         return Path(abs_path(DETECTOR_ENGINE_PATH))
     if model_is_engine:
         return model_path
 
     precision = {0: "fp32", 1: "int8", 2: "fp16"}.get(DETECTOR_NETWORK_MODE, "fp16")
-    dims_tag = DETECTOR_INFER_DIMS.replace(";", "x").replace(",", "x")
+    dims_tag = infer_dims.replace(";", "x").replace(",", "x")
     config_candidate = model_path.with_name(
         f"{model_path.name}_b{len(RTSP_URLS)}_{dims_tag}_gpu0_{precision}.engine"
     )
@@ -543,7 +667,8 @@ def build_detector_config() -> str:
 
     model_path = Path(abs_path(DETECTOR_MODEL_PATH))
     model_is_engine = model_path.suffix.lower() == ".engine"
-    engine_path = resolve_detector_engine_path(model_path, model_is_engine)
+    infer_dims = resolve_detector_infer_dims(model_path, model_is_engine)
+    engine_path = resolve_detector_engine_path(model_path, model_is_engine, infer_dims)
 
     lines = [
         "[property]",
@@ -553,7 +678,7 @@ def build_detector_config() -> str:
         f"labelfile-path={abs_path(DETECTOR_LABELS_PATH)}",
         "net-scale-factor=0.00392156862745098",
         "model-color-format=0",
-        f"infer-dims={DETECTOR_INFER_DIMS}",
+        f"infer-dims={infer_dims}",
         f"network-mode={DETECTOR_NETWORK_MODE}",
         f"interval={DETECTOR_INTERVAL}",
         f"gie-unique-id={PRIMARY_GIE_ID}",
