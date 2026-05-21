@@ -1206,7 +1206,7 @@ def create_app():
         )
 
     @app.get("/video/cam/{cam_id}")
-    def video_cam(cam_id: int = Path(ge=1, le=len(RTSP_URLS))):
+    def video_cam(cam_id: int = Path(..., ge=1, le=len(RTSP_URLS))):
         pipeline = state["pipeline"]
         if not pipeline:
             return JSONResponse({"error": "pipeline not started"}, status_code=400)
